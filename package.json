@@ -1,0 +1,14 @@
+{
+  "name": "gamehub-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "쉬는 시간 게임판 - 온라인 방(이어쓰기/픽셀 맞추기 등) 상태를 공유하는 아주 작은 서버",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {}
+}
