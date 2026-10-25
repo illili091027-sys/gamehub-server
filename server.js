@@ -9,6 +9,7 @@
 // - GET  /api/ping                        : 서버가 켜져 있는지 확인용
 // - GET  /api/state?room=..&game=..       : 그 방/게임의 저장된 상태 읽기
 // - POST /api/state?room=..&game=..       : 그 방/게임의 상태를 통째로 저장(덮어쓰기)
+// - GET  /api/states?room=..&prefix=..    : 이름이 prefix로 시작하는 상태들을 한 번에 읽기 (실시간 게임용)
 // - GET  /api/room/state?room=..          : 로비 상태(플레이어 목록/방장/선택된 게임) 읽기
 // - POST /api/room/join                   : 방에 입장(또는 갱신) {room, playerId, name}
 // - POST /api/room/heartbeat              : 살아있다고 알리기 {room, playerId}
@@ -137,7 +138,23 @@ const server = http.createServer((req, res) => {
   }
 
   if (url.pathname === '/api/ping' && req.method === 'GET') {
-    return sendJson(res, 200, { ok: true, time: Date.now() });
+    return sendJson(res, 200, { ok: true, time: Date.now(), batch: true });
+  }
+
+  // 여러 사람의 상태를 한 번에 읽기 (예: prefix=pio_ → pio_사람1, pio_사람2 ...)
+  // 땅따먹기/블록 배틀처럼 빠르게 주고받는 게임에서 요청 수를 크게 줄여줘요.
+  if (url.pathname === '/api/states' && req.method === 'GET') {
+    const room = url.searchParams.get('room') || '';
+    const prefix = url.searchParams.get('prefix') || '';
+    if (!isValidToken(room) || !isValidToken(prefix)) {
+      return sendJson(res, 400, { error: 'room, prefix 파라미터가 올바르지 않아요' });
+    }
+    const head = makeKey(room, prefix);
+    const out = {};
+    for (const [key, entry] of store) {
+      if (key.startsWith(head)) out[key.slice(room.length + 2)] = entry.data;
+    }
+    return sendJson(res, 200, { data: out });
   }
 
   if (url.pathname === '/api/state' && req.method === 'GET') {
