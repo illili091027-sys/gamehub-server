@@ -32,7 +32,8 @@ const MAX_BODY_BYTES = 1024 * 1024; // 요청 본문 최대 1MB
 
 // room(대문자) -> { hostId, currentGame, players: Map(playerId -> {name, lastSeen}), updatedAt }
 const rooms = new Map();
-const PRESENCE_TIMEOUT_MS = 10 * 1000; // 이 시간 동안 하트비트 없으면 나간 것으로 간주
+const AWAY_MS = 12 * 1000;             // 이 시간 넘게 소식이 없으면 '잠깐 자리 비움'으로 표시만
+const KICK_MEMORY_MS = 10 * 60 * 1000; // 추방된 사람은 10분 동안 자동 재입장 안 됨
 const NAME_MAX_LEN = 20;
 
 function isValidToken(v) {
@@ -55,34 +56,55 @@ setInterval(() => {
   }
 }, 30 * 60 * 1000).unref();
 
-// 방 안에서 하트비트가 끊긴(PRESENCE_TIMEOUT_MS 이상 지난) 플레이어를 정리하고,
+// 방 정리: 사람을 자동으로 빼지는 않고, 방장이 오래 응답 없을 때만 방장을 넘겨요
 // 방장이 나갔으면 남은 사람 중 아무나(가장 먼저 들어온 사람) 새 방장으로 승격
+/* 자동 추방은 껐어요: 응답이 없어도 명단에서 빼지 않아요(💤 자리 비움으로만 표시).
+   방에서 빠지는 건 ① 직접 나가기/창 닫기 ② 방장이 추방했을 때뿐이에요.
+   다만 방장이 오래(HOST_AWAY_MS) 응답이 없으면, 게임이 멈추지 않게 지금 접속 중인 사람에게 방장만 넘겨요. */
+const HOST_AWAY_MS = 60 * 1000;
+const GHOST_MS = 30 * 60 * 1000; // 30분 넘게 아무 소식 없는 사람(창을 그냥 꺼버린 경우)만 명단 정리
 function pruneRoom(room) {
   const now = Date.now();
   for (const [pid, p] of room.players) {
-    if (now - p.lastSeen > PRESENCE_TIMEOUT_MS) room.players.delete(pid);
+    if (now - p.lastSeen > GHOST_MS) room.players.delete(pid);
   }
   if (room.hostId && !room.players.has(room.hostId)) {
     const next = room.players.keys().next();
     room.hostId = next.done ? null : next.value;
+  }
+  const host = room.hostId && room.players.get(room.hostId);
+  if (host && now - host.lastSeen > HOST_AWAY_MS) {
+    for (const [pid, p] of room.players) {
+      if (now - p.lastSeen <= AWAY_MS) { room.hostId = pid; break; }
+    }
   }
 }
 
 function getOrCreateRoom(roomCode) {
   let room = rooms.get(roomCode);
   if (!room) {
-    room = { hostId: null, currentGame: null, players: new Map(), updatedAt: Date.now() };
+    room = { hostId: null, currentGame: null, players: new Map(), kicked: new Map(), updatedAt: Date.now() };
     rooms.set(roomCode, room);
   }
   return room;
 }
 
-function roomStateJson(room) {
-  return {
+function roomStateJson(room, forPid) {
+  const now = Date.now();
+  const out = {
     hostId: room.hostId,
     currentGame: room.currentGame,
-    players: Array.from(room.players, ([id, p]) => ({ id: id, name: p.name })),
+    players: Array.from(room.players, ([id, p]) => ({ id: id, name: p.name, away: now - p.lastSeen > AWAY_MS })),
   };
+  if (forPid && room.kicked && room.kicked.has(forPid)) out.kicked = true;
+  return out;
+}
+function isKicked(room, pid) {
+  if (!room.kicked) room.kicked = new Map();
+  const t = room.kicked.get(pid);
+  if (!t) return false;
+  if (Date.now() - t > KICK_MEMORY_MS) { room.kicked.delete(pid); return false; }
+  return true;
 }
 
 function setCors(res) {
@@ -212,6 +234,8 @@ const server = http.createServer((req, res) => {
       const r = getOrCreateRoom(roomCode);
       pruneRoom(r);
       const isNew = !r.players.has(playerId);
+      if (body.auto && isKicked(r, playerId)) return sendJson(res, 200, roomStateJson(r, playerId));
+      if (r.kicked) r.kicked.delete(playerId); // 직접 다시 입장하면 허용
       r.players.set(playerId, { name: name, lastSeen: Date.now() });
       if (!r.hostId) r.hostId = playerId; // 방에 아무도 없었으면 내가 방장
       r.updatedAt = Date.now();
@@ -226,14 +250,18 @@ const server = http.createServer((req, res) => {
       const playerId = String(body.playerId || '');
       if (!isValidToken(room) || !isValidToken(playerId)) return sendJson(res, 400, { error: 'bad_request' });
       const roomCode = room.toUpperCase();
-      const r = rooms.get(roomCode);
-      if (r && r.players.has(playerId)) {
-        r.players.get(playerId).lastSeen = Date.now();
-        r.updatedAt = Date.now();
-      }
       const r2 = getOrCreateRoom(roomCode);
+      const name = String(body.name || '').slice(0, NAME_MAX_LEN);
+      if (r2.players.has(playerId)) {
+        r2.players.get(playerId).lastSeen = Date.now();
+      } else if (name && !isKicked(r2, playerId)) {
+        /* 잠깐 끊겼다 돌아온 사람(또는 서버가 재시작돼서 방이 비었을 때)은 자동으로 다시 넣어줘요 */
+        r2.players.set(playerId, { name: name, lastSeen: Date.now() });
+        if (!r2.hostId) r2.hostId = playerId;
+      }
+      r2.updatedAt = Date.now();
       pruneRoom(r2);
-      return sendJson(res, 200, roomStateJson(r2));
+      return sendJson(res, 200, roomStateJson(r2, playerId));
     });
   }
 
@@ -287,6 +315,8 @@ const server = http.createServer((req, res) => {
       if (r.hostId !== hostId) return sendJson(res, 403, { error: '방장만 추방할 수 있어요' });
       if (targetId === hostId) return sendJson(res, 400, { error: '자기 자신은 추방할 수 없어요' });
       r.players.delete(targetId);
+      if (!r.kicked) r.kicked = new Map();
+      r.kicked.set(targetId, Date.now());
       r.updatedAt = Date.now();
       return sendJson(res, 200, roomStateJson(r));
     });
