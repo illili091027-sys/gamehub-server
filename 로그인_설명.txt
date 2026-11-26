@@ -1,0 +1,41 @@
+[로그인(계정) 기능 설명]
+
+1) 실행: 예전처럼  node server.js  (설치할 것 없음, Node 18 이상)
+
+2) 가입한 계정은 accounts.json 파일에 저장돼요.
+   - 비밀번호는 암호화(scrypt)해서 저장하고, 원래 비밀번호는 서버도 몰라요.
+   - 파일 위치를 바꾸려면 환경변수 ACCOUNTS_FILE 을 쓰세요. 예) ACCOUNTS_FILE=/data/accounts.json node server.js
+
+3) 중요! accounts.json 이 '지워지지 않는 디스크'에 있어야 해요.
+   - 내 컴퓨터/라즈베리파이/VPS: 그냥 두면 돼요.
+   - Render 무료 서버처럼 재시작·재배포 때 파일이 사라지는 곳은 계정도 같이 사라져요.
+     (Persistent Disk를 붙이고 ACCOUNTS_FILE 을 그 안으로 지정하세요)
+
+4) 로그인에 쓰는 서버 주소는 https:// 여야 해요 (GitHub Pages 사이트가 https라서 http 서버는 브라우저가 막아요).
+
+5) 관리자(비밀번호 초기화) 설정
+   - 서버를 켤 때 ADMIN_KEY 라는 환경변수로 관리자 비밀번호를 정해요.  예) ADMIN_KEY=내비밀 node server.js
+     (Render라면 서버 설정의 Environment 칸에 ADMIN_KEY 를 추가)
+   - ADMIN_KEY 를 안 정하면 관리자 기능은 꺼져 있어요.
+   - 게임판 첫 화면 오른쪽 아래 '🔧 관리자' → 관리자 비밀번호 + 아이디 검색 → '비번 0000으로' 버튼.
+   - 초기화하면 그 계정의 비밀번호는 0000이 되고, 로그인돼 있던 기기는 로그아웃돼요.
+   - 0000은 모두가 아는 비밀번호라서, 초기화된 사람은 로그인 뒤 '비번 변경'으로 바로 바꾸라고 알려주세요.
+   - 관리자 비밀번호를 10번 틀리면 5분간 막혀요.
+
+6) 가입 정보 백업: accounts.json 파일 하나만 복사해 두면 돼요.
+
+API: POST /api/auth/register, /api/auth/login, /api/auth/logout · GET/POST /api/account/data
+
+
+[집 컴퓨터(윈도우)에서 서버 돌리기]
+1) Node.js 설치: https://nodejs.org 에서 LTS 버전을 받아 설치 (18 이상)
+2) 이 zip을 풀고, '서버켜기.bat'을 메모장으로 열어 ADMIN_KEY= 뒤에 관리자 비밀번호를 쓰고 저장
+3) '서버켜기.bat' 더블클릭 → "게임판 서버 시작됨" 이라고 나오면 성공 (창을 닫으면 꺼져요)
+4) 인터넷에 연결하기(ngrok, 무료):
+   - https://ngrok.com 가입 → 대시보드의 안내대로 ngrok 설치 + 'ngrok config add-authtoken ...' 한 번 실행
+   - 대시보드의 'Domains'에서 내 주소(예: abc123.ngrok-free.dev)를 확인
+   - '터널켜기.bat' 더블클릭
+5) 브라우저에서 https://내주소/api/ping 을 열어 {"ok":true...} 가 보이면 성공 (처음 한 번 경고 화면이 나오면 'Visit Site')
+6) 그 주소를 알려주면 게임판 파일의 서버 주소를 거기로 바꿔서 드려요.
+※ 서버켜기.bat 은 GitHub에 올리지 마세요 (관리자 비밀번호가 들어 있어요).
+※ ngrok 무료는 한 달 요청 2만 번 제한이 있어요. 로그인·저장은 요청이 적어서 괜찮지만, 방 놀이(실시간)까지 이 주소로 쓰면 금방 차요.

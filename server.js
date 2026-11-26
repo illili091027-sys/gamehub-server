@@ -26,6 +26,7 @@
 // - POST /api/account/data                : 내 저장 데이터 통째로 저장 {blob}
 // - POST /api/account/password            : 내 비밀번호 바꾸기 {oldPassword, newPassword}
 // - POST /api/admin/search                : (관리자) 아이디 검색 {adminKey, query}
+// - POST /api/admin/coins                 : (관리자) 분필 개수 바꾸기 {adminKey, id, coins}
 // - POST /api/admin/reset                 : (관리자) 비밀번호를 0000으로 초기화 {adminKey, id}
 // 관리자 비밀번호는 환경변수 ADMIN_KEY 로 정해요. (안 정하면 관리자 기능은 꺼져 있어요)
 // 계정은 accounts.json 파일에 저장돼요(환경변수 ACCOUNTS_FILE로 위치 변경 가능).
@@ -261,7 +262,7 @@ function cleanBlob(b) {
 function handleAccount(req, res, url) {
   const p = url.pathname;
   if (req.method !== 'POST' && !(p === '/api/account/data' && req.method === 'GET')) return false;
-  if (['/api/auth/register', '/api/auth/login', '/api/auth/logout', '/api/account/data', '/api/account/password', '/api/admin/search', '/api/admin/reset'].indexOf(p) < 0) return false;
+  if (['/api/auth/register', '/api/auth/login', '/api/auth/logout', '/api/account/data', '/api/account/password', '/api/admin/search', '/api/admin/reset', '/api/admin/coins'].indexOf(p) < 0) return false;
 
   const run = (body) => {
     if (p === '/api/auth/register') {
@@ -293,9 +294,9 @@ function handleAccount(req, res, url) {
       }
       if (!ok) { noteFail(fk); return sendJson(res, 401, { error: 'bad_login', message: '아이디나 비밀번호가 맞지 않아요' }); }
       fails.delete(fk);
-      return sendJson(res, 200, { token: newSession(id.toLowerCase()), id: u.id, blob: u.blob || {} });
+      return sendJson(res, 200, { token: newSession(id.toLowerCase()), id: u.id, blob: u.blob || {}, adminCoins: u.adminCoins || null });
     }
-    if (p === '/api/admin/search' || p === '/api/admin/reset') {
+    if (p === '/api/admin/search' || p === '/api/admin/reset' || p === '/api/admin/coins') {
       if (!ADMIN_KEY) return sendJson(res, 503, { error: 'admin_off', message: '서버에 관리자 비밀번호(ADMIN_KEY)가 설정되지 않았어요' });
       const fk = failKey(req, '__admin__');
       const left = lockedLeft(fk);
@@ -306,13 +307,27 @@ function handleAccount(req, res, url) {
       fails.delete(fk);
       if (p === '/api/admin/search') {
         const q = String(body.query || '').trim().toLowerCase();
-        const list = Object.keys(db.users).filter((k) => !q || k.includes(q)).slice(0, 30).map((k) => {
+        const list = Object.keys(db.users).filter((k) => !q || k.includes(q)).slice(0, 1000).map((k) => {
           const u = db.users[k];
           let coins = null;
           try { coins = JSON.parse((u.blob || {}).gamehub_wallet_v1).coins; } catch (e) {}
           return { id: u.id, createdAt: u.createdAt, updatedAt: u.updatedAt, coins: coins };
         });
         return sendJson(res, 200, { users: list, total: Object.keys(db.users).length });
+      }
+      if (p === '/api/admin/coins') {
+        const cu = db.users[String(body.id || '').trim().toLowerCase()];
+        if (!cu) return sendJson(res, 400, { error: 'no_user', message: '그런 아이디가 없어요' });
+        const n = Math.floor(Number(body.coins));
+        if (!Number.isFinite(n) || n < 0 || n > 1e9) return sendJson(res, 400, { error: 'bad_coins', message: '분필 개수가 이상해요' });
+        cu.blob = cu.blob || {};
+        let w = {}; try { w = JSON.parse(cu.blob.gamehub_wallet_v1 || '{}') || {}; } catch (e) {}
+        w.coins = n; if (!w.got) w.got = {}; if (!w.awarded) w.awarded = {};
+        cu.blob.gamehub_wallet_v1 = JSON.stringify(w);
+        cu.adminCoins = { rev: Date.now(), coins: n };   // 사용자 기기가 옛 값을 올려도 이 값이 우선
+        saveDbSoon();
+        console.log('[관리자] 분필 변경:', cu.id, n);
+        return sendJson(res, 200, { ok: true, coins: n });
       }
       const key = String(body.id || '').trim().toLowerCase();
       const u = db.users[key];
@@ -344,7 +359,7 @@ function handleAccount(req, res, url) {
       saveDbSoon();
       return sendJson(res, 200, { ok: true });
     }
-    if (req.method === 'GET') return sendJson(res, 200, { id: who.user.id, blob: who.user.blob || {} });
+    if (req.method === 'GET') return sendJson(res, 200, { id: who.user.id, blob: who.user.blob || {}, adminCoins: who.user.adminCoins || null });
     who.user.blob = cleanBlob(body.blob);
     who.user.updatedAt = Date.now();
     saveDbSoon();
