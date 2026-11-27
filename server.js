@@ -164,7 +164,7 @@ function readJsonBody(req, cb) {
 
 // ===================== 계정 (아이디/비밀번호) =====================
 const ACCOUNTS_FILE = process.env.ACCOUNTS_FILE || path.join(__dirname, 'accounts.json');
-const ADMIN_KEY = process.env.ADMIN_KEY || '';
+const ADMIN_KEY = String(process.env.ADMIN_KEY || '').trim().replace(/^(["'])(.*)\1$/, '$2').trim();   // 앞뒤 공백·따옴표가 같이 들어가도 무시
 const RESET_PW = '0000';
 const MAX_USERS = 3000;
 const MAX_BLOB_BYTES = 300 * 1024;      // 한 사람이 저장할 수 있는 데이터 총량
@@ -394,7 +394,7 @@ const server = http.createServer((req, res) => {
   }
 
   if (url.pathname === '/api/ping' && req.method === 'GET') {
-    return sendJson(res, 200, { ok: true, time: Date.now(), batch: true, auth: true });
+    return sendJson(res, 200, { ok: true, time: Date.now(), batch: true, auth: true, admin: !!ADMIN_KEY });
   }
 
   // 여러 사람의 상태를 한 번에 읽기 (예: prefix=pio_ → pio_사람1, pio_사람2 ...)
@@ -582,4 +582,5 @@ const server = http.createServer((req, res) => {
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log('게임판 서버 시작됨: http://localhost:' + PORT);
+  console.log(ADMIN_KEY ? '관리자 기능: 켜짐 (비밀번호 ' + ADMIN_KEY.length + '글자)' : '관리자 기능: 꺼짐 ← ADMIN_KEY 가 설정되지 않았어요');
 });
