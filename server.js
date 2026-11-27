@@ -176,10 +176,11 @@ const BLOB_SKIP = new Set(['gamehub_server_url', 'gamehub_player_id', 'gamehub_l
 
 // users: idLower -> { id, salt, hash, createdAt, updatedAt, blob }
 // sessions: sha256(token) -> { user, at }
-let db = { users: {}, sessions: {} };
+let db = { users: {}, sessions: {}, adminLog: [] };
+const STARTED_AT = Date.now();
 try {
   const loaded = JSON.parse(fs.readFileSync(ACCOUNTS_FILE, 'utf8'));
-  if (loaded && loaded.users) db = { users: loaded.users, sessions: loaded.sessions || {} };
+  if (loaded && loaded.users) db = { users: loaded.users, sessions: loaded.sessions || {}, adminLog: Array.isArray(loaded.adminLog) ? loaded.adminLog : [] };
   console.log('계정 ' + Object.keys(db.users).length + '개 불러옴 (' + ACCOUNTS_FILE + ')');
 } catch (e) { /* 처음 켠 경우 */ }
 
@@ -201,6 +202,18 @@ function flushDb() {
 process.on('SIGTERM', () => { flushDb(); process.exit(0); });
 process.on('SIGINT', () => { flushDb(); process.exit(0); });
 
+// 관리자가 한 일을 남겨요 (최근 300개)
+function alog(action, target, detail) {
+  db.adminLog.push({ t: Date.now(), a: action, u: target || '', d: detail || '' });
+  if (db.adminLog.length > 300) db.adminLog.splice(0, db.adminLog.length - 300);
+  saveDbSoon();
+}
+function dropSessions(key) {
+  let n = 0;
+  for (const h of Object.keys(db.sessions)) if (db.sessions[h].user === key) { delete db.sessions[h]; n++; }
+  return n;
+}
+
 function hashPw(pw, salt) { return crypto.scryptSync(pw, salt, 64).toString('hex'); }
 function sha(t) { return crypto.createHash('sha256').update(t).digest('hex'); }
 function newSession(userKey) {
@@ -219,7 +232,7 @@ function userFromToken(token) {
   const s = db.sessions[sha(token)];
   if (!s) return null;
   if (Date.now() - s.at > SESSION_MS) { delete db.sessions[sha(token)]; saveDbSoon(); return null; }
-  return db.users[s.user] ? { key: s.user, user: db.users[s.user] } : null;
+  return db.users[s.user] && !db.users[s.user].banned ? { key: s.user, user: db.users[s.user] } : null;
 }
 setInterval(() => {
   const now = Date.now();
@@ -262,7 +275,7 @@ function cleanBlob(b) {
 function handleAccount(req, res, url) {
   const p = url.pathname;
   if (req.method !== 'POST' && !(p === '/api/account/data' && req.method === 'GET')) return false;
-  if (['/api/auth/register', '/api/auth/login', '/api/auth/logout', '/api/account/data', '/api/account/password', '/api/admin/search', '/api/admin/reset', '/api/admin/coins'].indexOf(p) < 0) return false;
+  if (['/api/auth/register', '/api/auth/login', '/api/auth/logout', '/api/account/data', '/api/account/password'].indexOf(p) < 0 && !p.startsWith('/api/admin/')) return false;
 
   const run = (body) => {
     if (p === '/api/auth/register') {
@@ -294,9 +307,11 @@ function handleAccount(req, res, url) {
       }
       if (!ok) { noteFail(fk); return sendJson(res, 401, { error: 'bad_login', message: '아이디나 비밀번호가 맞지 않아요' }); }
       fails.delete(fk);
+      if (u.banned) return sendJson(res, 403, { error: 'banned', message: '이용이 정지된 계정이에요. 관리자에게 물어봐요' });
+      u.lastLoginAt = Date.now();
       return sendJson(res, 200, { token: newSession(id.toLowerCase()), id: u.id, blob: u.blob || {}, adminCoins: u.adminCoins || null });
     }
-    if (p === '/api/admin/search' || p === '/api/admin/reset' || p === '/api/admin/coins') {
+    if (p.startsWith('/api/admin/')) {
       if (!ADMIN_KEY) return sendJson(res, 503, { error: 'admin_off', message: '서버에 관리자 비밀번호(ADMIN_KEY)가 설정되지 않았어요' });
       const fk = failKey(req, '__admin__');
       const left = lockedLeft(fk);
@@ -311,7 +326,9 @@ function handleAccount(req, res, url) {
           const u = db.users[k];
           let coins = null;
           try { coins = JSON.parse((u.blob || {}).gamehub_wallet_v1).coins; } catch (e) {}
-          return { id: u.id, createdAt: u.createdAt, updatedAt: u.updatedAt, coins: coins };
+          let ses = 0; for (const h of Object.keys(db.sessions)) if (db.sessions[h].user === k) ses++;
+          let bytes = 0; try { bytes = Buffer.byteLength(JSON.stringify(u.blob || {})); } catch (e) {}
+          return { id: u.id, createdAt: u.createdAt, updatedAt: u.updatedAt, lastLoginAt: u.lastLoginAt || null, coins: coins, sessions: ses, bytes: bytes, banned: !!u.banned };
         });
         return sendJson(res, 200, { users: list, total: Object.keys(db.users).length });
       }
@@ -327,8 +344,106 @@ function handleAccount(req, res, url) {
         cu.adminCoins = { rev: Date.now(), coins: n };   // 사용자 기기가 옛 값을 올려도 이 값이 우선
         saveDbSoon();
         console.log('[관리자] 분필 변경:', cu.id, n);
+        alog('분필 변경', cu.id, n + '개로');
         return sendJson(res, 200, { ok: true, coins: n });
       }
+
+      if (p === '/api/admin/stats') {
+        const now = Date.now(), DAY = 86400000;
+        const keys = Object.keys(db.users);
+        let coinsSum = 0, active24 = 0, activeNow = 0, banned = 0, blobBytes = 0;
+        const signups7 = [0, 0, 0, 0, 0, 0, 0];
+        for (const k of keys) {
+          const u = db.users[k];
+          try { coinsSum += Number(JSON.parse((u.blob || {}).gamehub_wallet_v1).coins) || 0; } catch (e) {}
+          if (u.updatedAt && now - u.updatedAt < DAY) active24++;
+          if (u.updatedAt && now - u.updatedAt < 10 * 60 * 1000) activeNow++;
+          if (u.banned) banned++;
+          try { blobBytes += Buffer.byteLength(JSON.stringify(u.blob || {})); } catch (e) {}
+          const age = Math.floor((now - (u.createdAt || 0)) / DAY);
+          if (age >= 0 && age < 7) signups7[age]++;
+        }
+        let rp = 0; for (const r of rooms.values()) rp += r.players.size;
+        let fileBytes = null; try { fileBytes = fs.statSync(ACCOUNTS_FILE).size; } catch (e) {}
+        const mem = process.memoryUsage();
+        return sendJson(res, 200, {
+          users: keys.length, maxUsers: MAX_USERS, active24: active24, activeNow: activeNow, banned: banned,
+          signups7: signups7, coinsSum: coinsSum, sessions: Object.keys(db.sessions).length,
+          rooms: rooms.size, roomPlayers: rp, storeEntries: store.size, blobBytes: blobBytes, fileBytes: fileBytes,
+          uptimeSec: Math.floor(process.uptime()), startedAt: STARTED_AT, rss: mem.rss, heapUsed: mem.heapUsed,
+          node: process.version, platform: process.platform, logCount: db.adminLog.length, now: now
+        });
+      }
+      if (p === '/api/admin/delete') {
+        const dk = String(body.id || '').trim().toLowerCase();
+        const du = db.users[dk];
+        if (!du) return sendJson(res, 404, { error: 'no_user', message: '그런 아이디가 없어요' });
+        delete db.users[dk]; dropSessions(dk);
+        saveDbSoon(); alog('계정 삭제', du.id, '');
+        console.log('[관리자] 계정 삭제:', du.id);
+        return sendJson(res, 200, { ok: true, id: du.id });
+      }
+      if (p === '/api/admin/kick') {
+        const kk = String(body.id || '').trim().toLowerCase();
+        const ku = db.users[kk];
+        if (!ku) return sendJson(res, 404, { error: 'no_user', message: '그런 아이디가 없어요' });
+        const n = dropSessions(kk);
+        saveDbSoon(); alog('강제 로그아웃', ku.id, n + '기기');
+        return sendJson(res, 200, { ok: true, devices: n });
+      }
+      if (p === '/api/admin/ban') {
+        const bk = String(body.id || '').trim().toLowerCase();
+        const bu = db.users[bk];
+        if (!bu) return sendJson(res, 404, { error: 'no_user', message: '그런 아이디가 없어요' });
+        bu.banned = !!body.banned;
+        if (bu.banned) dropSessions(bk);
+        saveDbSoon(); alog(bu.banned ? '이용 정지' : '정지 해제', bu.id, '');
+        return sendJson(res, 200, { ok: true, banned: bu.banned });
+      }
+      if (p === '/api/admin/rooms') {
+        const now = Date.now();
+        const list = Array.from(rooms, ([code, r]) => {
+          const host = r.players.get(r.hostId);
+          return {
+            code: code, hostName: host ? host.name : '', currentGame: r.currentGame || '', updatedAt: r.updatedAt,
+            players: Array.from(r.players, ([pid, pl]) => ({ name: pl.name, away: now - pl.lastSeen > AWAY_MS }))
+          };
+        }).sort((a, b) => b.updatedAt - a.updatedAt);
+        return sendJson(res, 200, { rooms: list });
+      }
+      if (p === '/api/admin/closeroom') {
+        const code = String(body.code || '').trim().toUpperCase();
+        if (!rooms.has(code)) return sendJson(res, 404, { error: 'no_room', message: '그런 방이 없어요' });
+        rooms.delete(code);
+        for (const k of Array.from(store.keys())) if (k.startsWith(code + '::')) store.delete(k);
+        alog('방 닫기', code, '');
+        return sendJson(res, 200, { ok: true });
+      }
+      if (p === '/api/admin/log') {
+        return sendJson(res, 200, { log: db.adminLog.slice(-100).reverse() });
+      }
+      if (p === '/api/admin/backup') {
+        alog('백업 내려받기', '', Object.keys(db.users).length + '명');
+        return sendJson(res, 200, { app: 'gamehub', exportedAt: Date.now(), users: db.users });
+      }
+      if (p === '/api/admin/restore') {
+        const src = body.users;
+        if (!src || typeof src !== 'object' || Array.isArray(src)) return sendJson(res, 400, { error: 'bad_backup', message: '백업 파일이 올바르지 않아요' });
+        let added = 0, skipped = 0;
+        for (const k of Object.keys(src)) {
+          const u = src[k];
+          const ok = u && typeof u === 'object' && typeof u.id === 'string' && ID_RE.test(u.id) && u.id.toLowerCase() === k &&
+                     typeof u.salt === 'string' && typeof u.hash === 'string' && /^[0-9a-f]+$/.test(u.hash) && u.hash.length === 128;
+          if (!ok || db.users[k] || Object.keys(db.users).length >= MAX_USERS) { skipped++; continue; }
+          db.users[k] = { id: u.id, salt: u.salt, hash: u.hash, createdAt: Number(u.createdAt) || Date.now(), updatedAt: Number(u.updatedAt) || Date.now(),
+                          blob: cleanBlob(u.blob), banned: !!u.banned };
+          if (u.adminCoins && typeof u.adminCoins.coins === 'number') db.users[k].adminCoins = { rev: Number(u.adminCoins.rev) || Date.now(), coins: u.adminCoins.coins };
+          added++;
+        }
+        saveDbSoon(); alog('백업 복원', '', added + '명 추가, ' + skipped + '명 건너뜀');
+        return sendJson(res, 200, { ok: true, added: added, skipped: skipped });
+      }
+      if (p !== '/api/admin/reset') return sendJson(res, 404, { error: 'not_found', message: '없는 관리자 기능이에요' });
       const key = String(body.id || '').trim().toLowerCase();
       const u = db.users[key];
       if (!u) return sendJson(res, 404, { error: 'no_user', message: '그런 아이디가 없어요' });
@@ -338,6 +453,7 @@ function handleAccount(req, res, url) {
       for (const k of Array.from(fails.keys())) if (k.endsWith('|' + key)) fails.delete(k);
       saveDbSoon();
       console.log('[관리자] 비밀번호 초기화:', u.id);
+      alog('비밀번호 초기화', u.id, '');
       return sendJson(res, 200, { ok: true, id: u.id });
     }
     const who = userFromToken(tokenFrom(req, body));
